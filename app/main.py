@@ -3,10 +3,16 @@
 单进程内存态的 HTTP 服务：按会话维护连续编号的整数样本，
 支持以当前末条为中心触发片段（前 before 条 + 中心 + 后 after 条），
 片段等后续样本到齐后完成；最近 H 条历史与所有未删除片段共同占用容量 C。
+
+可选的整数模式识别：会话可在首条样本写入前配置一次长度 1～32 的整数
+pattern，此后每条成功写入的样本经流式 KMP 自动机精确匹配（允许重叠）。
+自动机只保存标量状态，不保存原始样本、不占用样本容量，故样本回收与
+片段增删均不影响识别进度；命中记录在样本回收后仍然保留。
 """
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, model_validator
@@ -34,6 +40,63 @@ class WriteSampleRequest(BaseModel):
 class TriggerRequest(BaseModel):
     before: int = Field(ge=0, description="中心之前的条数（非负整数）")
     after: int = Field(ge=0, description="中心之后的条数（非负整数）")
+
+
+class ConfigurePatternRequest(BaseModel):
+    pattern: list[int] = Field(description="待识别的整数模式，长度 1～32；元素必须为整数")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _check_pattern(cls, data: object) -> object:
+        # 显式校验，确保布尔值、字符串、浮点等不会被宽松转换为整数（返回 422）
+        if not isinstance(data, dict) or not isinstance(data.get("pattern"), list):
+            raise ValueError("pattern 必须是整数数组，长度 1～32")
+        pattern = data["pattern"]
+        if not (1 <= len(pattern) <= 32):
+            raise ValueError("pattern 长度必须在 1～32 之间")
+        if any(type(x) is not int for x in pattern):
+            raise ValueError("pattern 元素必须是整数，不能为布尔值或字符串")
+        return data
+
+
+# ---------------- 流式模式匹配（KMP 自动机） ----------------
+
+class PatternMatcher:
+    """只保存标量状态的流式 KMP：逐样本喂入，不保存原始样本。
+
+    state 为当前匹配到的 pattern 前缀长度；feed 在恰好完整匹配时返回
+    True，否则返回 False。失败回退允许重叠命中。pattern 可以长于 H 和 C：
+    进度只依赖自动机状态，与样本是否被回收无关。
+    """
+
+    __slots__ = ("pattern", "failure", "state")
+
+    def __init__(self, pattern: list[int]):
+        self.pattern = pattern
+        m = len(pattern)
+        failure = [0] * m
+        k = 0
+        for i in range(1, m):
+            while k > 0 and pattern[i] != pattern[k]:
+                k = failure[k - 1]
+            if pattern[i] == pattern[k]:
+                k += 1
+            failure[i] = k
+        self.failure = failure
+        self.state = 0
+
+    def feed(self, value: int) -> bool:
+        m = len(self.pattern)
+        k = self.state
+        while k > 0 and value != self.pattern[k]:
+            k = self.failure[k - 1]
+        if value == self.pattern[k]:
+            k += 1
+        if k == m:
+            self.state = self.failure[k - 1]  # 回退以支持重叠命中
+            return True
+        self.state = k
+        return False
 
 
 # ---------------- 会话状态 ----------------
@@ -71,6 +134,12 @@ class Session:
         self.samples: dict[int, int] = {}  # 当前存活的样本：序号 -> 值
         self.fragments: dict[int, Fragment] = {}  # 未删除的片段
         self.next_fragment_id = 1
+        # 模式识别：仅首条样本写入前可配置一次；状态不占用样本容量
+        self.pattern: list[int] | None = None
+        self.matcher: PatternMatcher | None = None
+        self.pattern_configured = False
+        self.hit_count = 0
+        self.recent_hits: deque[dict] = deque(maxlen=100)  # 最近 100 次命中
         self.lock = asyncio.Lock()
 
     # ---- 容量核算 ----
@@ -96,10 +165,34 @@ class Session:
             if seq not in live:
                 del self.samples[seq]
 
+    # ---- 模式识别 ----
+
+    def configure_pattern(self, pattern: list[int]) -> None:
+        """配置识别模式；重复配置或首条样本已写入后配置均抛 409。"""
+        if self.pattern_configured:
+            raise _conflict("该会话已配置过 pattern，不可重复配置")
+        if self.next_seq > 1:
+            raise _conflict("首条样本已写入，pattern 仅能在首条样本写入前配置一次")
+        self.pattern = list(pattern)
+        self.matcher = PatternMatcher(self.pattern)
+        self.pattern_configured = True
+
+    def observe(self, seq: int, value: int) -> None:
+        """样本成功提交后喂入自动机；命中则追加记录（与写样本同一串行临界区）。"""
+        if self.matcher is not None and self.matcher.feed(value):
+            assert self.pattern is not None
+            m = len(self.pattern)
+            self.hit_count += 1
+            self.recent_hits.append({"start_seq": seq - m + 1, "end_seq": seq})
+
     # ---- 操作 ----
 
     def write(self, value: int) -> int:
-        """写入一条样本；容量不足时抛 409，不消耗序号、不改变历史或片段。"""
+        """写入一条样本；容量不足时抛 409，不消耗序号、不改变历史或片段。
+
+        容量拒绝时不推进匹配状态、不产生命中记录；只有成功提交才喂入自动机，
+        因此同一值被拒绝后重试成功只会被识别一次。
+        """
         n = self.next_seq
         needed = self.needed_seqs(n)
         if len(needed) > self.capacity:
@@ -109,6 +202,7 @@ class Session:
         kept[n] = value
         self.samples = kept
         self.next_seq = n + 1
+        self.observe(n, value)
         return n
 
     def trigger(self, before: int, after: int) -> Fragment:
@@ -214,6 +308,28 @@ async def write_sample(session_id: int, req: WriteSampleRequest) -> dict:
     async with sess.lock:
         seq = sess.write(req.value)
         return {"seq": seq, "value": req.value}
+
+
+@app.put("/sessions/{session_id}/pattern")
+async def configure_pattern(session_id: int, req: ConfigurePatternRequest) -> dict:
+    sess = _get_session(session_id)
+    async with sess.lock:
+        sess.configure_pattern(req.pattern)
+        return {"pattern": sess.pattern}
+
+
+@app.get("/sessions/{session_id}/pattern/hits")
+async def get_pattern_hits(session_id: int) -> dict:
+    sess = _get_session(session_id)
+    async with sess.lock:
+        if not sess.pattern_configured:
+            raise _conflict("该会话尚未配置 pattern")
+        return {
+            "pattern": sess.pattern,
+            "hit_count": sess.hit_count,
+            # 按命中产生顺序保存，即按 start_seq 升序；只保留最近 100 次
+            "recent_hits": list(sess.recent_hits),
+        }
 
 
 @app.post("/sessions/{session_id}/triggers", status_code=201)
