@@ -3,10 +3,17 @@
 单进程内存态的 HTTP 服务：按会话维护连续编号的整数样本，
 支持以当前末条为中心触发片段（前 before 条 + 中心 + 后 after 条），
 片段等后续样本到齐后完成；最近 H 条历史与所有未删除片段共同占用容量 C。
+
+可选地为会话配置一次整数 pattern（1～32 个），用 KMP 自动机流式识别
+采样流中反复出现的连续值片段（允许重叠，pattern 可长于 H/C）；
+识别只保留模式与命中序号区间，不额外保存原始样本、不占用容量，
+片段触发、删除与样本回收均不影响识别进度和命中记录。
 """
 from __future__ import annotations
 
 import asyncio
+from collections import deque
+from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, model_validator
@@ -34,6 +41,35 @@ class WriteSampleRequest(BaseModel):
 class TriggerRequest(BaseModel):
     before: int = Field(ge=0, description="中心之前的条数（非负整数）")
     after: int = Field(ge=0, description="中心之后的条数（非负整数）")
+
+
+class ConfigurePatternRequest(BaseModel):
+    pattern: list[Any] = Field(description="待识别的整数模式（1～32 个整数）")
+
+    @model_validator(mode="after")
+    def _validate_pattern(self) -> "ConfigurePatternRequest":
+        if len(self.pattern) < 1 or len(self.pattern) > 32:
+            raise ValueError("pattern 长度必须在 1～32 之间")
+        for elem in self.pattern:
+            # bool 是 int 的子类，必须显式拒绝；字符串等一律视为非法
+            if isinstance(elem, bool) or not isinstance(elem, int):
+                raise ValueError("pattern 的每个元素都必须是整数")
+        return self
+
+
+# ---------------- 模式识别 ----------------
+
+def _kmp_failure(pattern: list[int]) -> list[int]:
+    """KMP 前缀函数：pi[i] = pattern[:i+1] 的最长相等真前缀/真后缀长度。"""
+    pi = [0] * len(pattern)
+    k = 0
+    for i in range(1, len(pattern)):
+        while k > 0 and pattern[i] != pattern[k]:
+            k = pi[k - 1]
+        if pattern[i] == pattern[k]:
+            k += 1
+        pi[i] = k
+    return pi
 
 
 # ---------------- 会话状态 ----------------
@@ -71,7 +107,52 @@ class Session:
         self.samples: dict[int, int] = {}  # 当前存活的样本：序号 -> 值
         self.fragments: dict[int, Fragment] = {}  # 未删除的片段
         self.next_fragment_id = 1
+        # 模式识别状态（configure_pattern 之前为 None）；不保留任何原始样本
+        self.pattern: list[int] | None = None
+        self._kmp_pi: list[int] | None = None
+        self._match_len = 0               # KMP 当前匹配长度（仅消费成功写入的值）
+        self.hit_count = 0                # 累计命中数（允许重叠，每条都计）
+        self.hits: deque[tuple[int, int]] = deque(maxlen=100)  # 最近 100 次命中
         self.lock = asyncio.Lock()
+
+    # ---- 模式识别 ----
+
+    def configure_pattern(self, pattern: list[int]) -> None:
+        """首条样本写入前可配置一次；重复配置或已有样本时抛 409。"""
+        if self.pattern is not None:
+            raise _conflict("pattern 已配置，每个会话仅可配置一次")
+        if self.next_seq > 1:
+            raise _conflict("首条样本写入后不可再配置 pattern")
+        self.pattern = pattern
+        self._kmp_pi = _kmp_failure(pattern)
+
+    def _advance_matcher(self, value: int, seq: int) -> None:
+        """向 KMP 自动机喂入一条成功写入的样本；命中时记录序号区间。
+
+        完全匹配后回退到 pi[m-1]，使相互重叠的命中也能各计一次。
+        """
+        pi, pattern = self._kmp_pi, self.pattern
+        k = self._match_len
+        while k > 0 and value != pattern[k]:
+            k = pi[k - 1]
+        if value == pattern[k]:
+            k += 1
+        if k == len(pattern):
+            start = seq - len(pattern) + 1
+            self.hit_count += 1
+            self.hits.append((start, seq))
+            k = pi[k - 1]
+        self._match_len = k
+
+    def hit_view(self) -> dict:
+        """累计命中数与最近 100 次命中，按起始序号升序。"""
+        return {
+            "count": self.hit_count,
+            "hits": [
+                {"start_seq": start, "end_seq": end}
+                for start, end in sorted(self.hits)
+            ],
+        }
 
     # ---- 容量核算 ----
 
@@ -109,6 +190,9 @@ class Session:
         kept[n] = value
         self.samples = kept
         self.next_seq = n + 1
+        # 仅成功写入的值参与识别：容量拒绝在上方抛出，不会推进匹配或产生记录
+        if self.pattern is not None:
+            self._advance_matcher(value, n)
         return n
 
     def trigger(self, before: int, after: int) -> Fragment:
@@ -214,6 +298,46 @@ async def write_sample(session_id: int, req: WriteSampleRequest) -> dict:
     async with sess.lock:
         seq = sess.write(req.value)
         return {"seq": seq, "value": req.value}
+
+
+@app.api_route(
+    "/sessions/{session_id}/pattern",
+    methods=["PUT", "POST"],
+    status_code=201,
+)
+async def configure_pattern(session_id: int, req: ConfigurePatternRequest) -> dict:
+    sess = _get_session(session_id)  # 未知会话 404
+    async with sess.lock:
+        sess.configure_pattern(req.pattern)
+        return {
+            "session_id": sess.session_id,
+            "pattern": sess.pattern,
+            "length": len(sess.pattern),
+            **sess.hit_view(),
+        }
+
+
+@app.get("/sessions/{session_id}/pattern")
+async def get_pattern(session_id: int) -> dict:
+    sess = _get_session(session_id)  # 未知会话 404
+    async with sess.lock:
+        if sess.pattern is None:
+            raise _conflict("该会话尚未配置 pattern")
+        return {
+            "session_id": sess.session_id,
+            "pattern": sess.pattern,
+            "length": len(sess.pattern),
+            **sess.hit_view(),
+        }
+
+
+@app.get("/sessions/{session_id}/pattern/hits")
+async def get_pattern_hits(session_id: int) -> dict:
+    sess = _get_session(session_id)  # 未知会话 404
+    async with sess.lock:
+        if sess.pattern is None:
+            raise _conflict("该会话尚未配置 pattern")
+        return {"session_id": sess.session_id, **sess.hit_view()}
 
 
 @app.post("/sessions/{session_id}/triggers", status_code=201)
